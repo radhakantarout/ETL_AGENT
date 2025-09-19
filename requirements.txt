@@ -1,0 +1,7 @@
+boto3
+anthropic
+pandas
+openpyxl
+pyspark
+gitpython
+requests

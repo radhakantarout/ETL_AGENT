@@ -1,0 +1,117 @@
+{
+  "categories": [
+    {
+      "name": "customers",
+      "input_s3": "s3://your-bucket/raw/customers.csv",
+      "rules": {
+        "customer_id": [
+          {
+            "type": "not_null"
+          },
+          {
+            "type": "unique"
+          }
+        ],
+        "email": [
+          {
+            "type": "not_null"
+          },
+          {
+            "type": "regex",
+            "pattern": "^.+@.+\\..+$"
+          }
+        ],
+        "first_name": [
+          {
+            "type": "not_null"
+          }
+        ],
+        "last_name": [
+          {
+            "type": "not_null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "orders",
+      "input_s3": "s3://your-bucket/raw/orders.csv",
+      "rules": {
+        "order_id": [
+          {
+            "type": "not_null"
+          },
+          {
+            "type": "unique"
+          }
+        ],
+        "customer_id": [
+          {
+            "type": "not_null"
+          }
+        ],
+        "total_amount": [
+          {
+            "type": "min",
+            "value": 0
+          }
+        ],
+        "status": [
+          {
+            "type": "allowed_values",
+            "values": [
+              "completed",
+              "processing",
+              "cancelled"
+            ]
+          }
+        ]
+      },
+      "fk": [
+        {
+          "col": "customer_id",
+          "ref_category": "customers",
+          "ref_col": "customer_id"
+        }
+      ]
+    },
+    {
+      "name": "order_items",
+      "input_s3": "s3://your-bucket/raw/order_items.csv",
+      "rules": {
+        "order_item_id": [
+          {
+            "type": "not_null"
+          },
+          {
+            "type": "unique"
+          }
+        ],
+        "order_id": [
+          {
+            "type": "not_null"
+          }
+        ],
+        "quantity": [
+          {
+            "type": "min",
+            "value": 1
+          }
+        ],
+        "unit_price": [
+          {
+            "type": "min",
+            "value": 0
+          }
+        ]
+      },
+      "fk": [
+        {
+          "col": "order_id",
+          "ref_category": "orders",
+          "ref_col": "order_id"
+        }
+      ]
+    }
+  ]
+}
