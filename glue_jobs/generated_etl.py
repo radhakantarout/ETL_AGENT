@@ -2,16 +2,16 @@
 import argparse
 import json
 import sys
-from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
 import boto3
-import pandas as pd
 from botocore.exceptions import ClientError
+import pandas as pd
+import re
+from urllib.parse import urlparse
 
-def create_spark_session(app_name="ETL_Pipeline"):
-    """Create Spark session with necessary configurations"""
+def create_spark_session(app_name="ETL_Job"):
     return SparkSession.builder \
         .appName(app_name) \
         .config("spark.sql.adaptive.enabled", "true") \
@@ -20,143 +20,157 @@ def create_spark_session(app_name="ETL_Pipeline"):
         .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain") \
         .getOrCreate()
 
-def read_dq_rules_from_s3(spark, rules_s3_path):
-    """Read data quality rules from S3"""
+def read_s3_json(s3_path, aws_region):
+    s3_client = boto3.client('s3', region_name=aws_region)
+    parsed_url = urlparse(s3_path)
+    bucket = parsed_url.netloc
+    key = parsed_url.path.lstrip('/')
+    
     try:
-        rules_df = spark.read.option("multiline", "true").text(rules_s3_path)
-        rules_content = rules_df.collect()[0][0]
-        return json.loads(rules_content)
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        content = response['Body'].read().decode('utf-8')
+        return json.loads(content)
     except Exception as e:
-        print(f"Error reading DQ rules from {rules_s3_path}: {str(e)}")
+        print(f"Error reading {s3_path}: {str(e)}")
         return {}
 
-def read_business_mapping_from_s3(s3_bucket, aws_region):
-    """Read business mapping from Excel file in S3"""
+def read_excel_from_s3(s3_path, aws_region):
+    s3_client = boto3.client('s3', region_name=aws_region)
+    parsed_url = urlparse(s3_path)
+    bucket = parsed_url.netloc
+    key = parsed_url.path.lstrip('/')
+    
     try:
-        s3_client = boto3.client('s3', region_name=aws_region)
-        obj = s3_client.get_object(Bucket=s3_bucket, Key='raw/business_mapping.xlsx')
-        mapping_df = pd.read_excel(obj['Body'].read())
-        return mapping_df.to_dict('records')
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        content = response['Body'].read()
+        df = pd.read_excel(content, engine='openpyxl')
+        return df
     except Exception as e:
-        print(f"Error reading business mapping: {str(e)}")
-        return []
+        print(f"Error reading Excel file {s3_path}: {str(e)}")
+        return pd.DataFrame()
 
-def discover_csv_files(spark, s3_path):
-    """Discover all CSV files in S3 path"""
+def discover_csv_files(spark, source_path):
     try:
-        hadoop_conf = spark._jsc.hadoopConfiguration()
-        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
-        path = spark._jvm.org.apache.hadoop.fs.Path(s3_path)
-        
-        file_list = []
-        if fs.exists(path):
-            files = fs.listStatus(path)
-            for file in files:
-                if file.getPath().getName().endswith('.csv'):
-                    file_list.append(str(file.getPath()))
-        
-        return file_list
+        # Try to read with wildcard pattern
+        df = spark.read.option("header", "true").option("inferSchema", "true").csv(f"{source_path}/*.csv")
+        return df
     except Exception as e:
-        print(f"Error discovering CSV files: {str(e)}")
-        return []
+        print(f"Error reading CSV files from {source_path}: {str(e)}")
+        return None
 
-def apply_data_quality_rules(df, dq_rules):
-    """Apply data quality rules and separate clean and reject records"""
-    if not dq_rules:
-        return df, df.limit(0)
+def apply_dq_rules(df, rules, source_file=None):
+    clean_df = df
+    reject_df = None
     
-    # Add a flag column to track quality issues
-    df_with_flag = df.withColumn("dq_flag", lit(True))
-    df_with_flag = df_with_flag.withColumn("dq_issues", lit(""))
+    if not rules:
+        return clean_df, reject_df
     
-    # Apply rules based on the structure of dq_rules
-    for table_name, rules in dq_rules.items():
-        if 'rules' in rules:
-            for rule in rules['rules']:
-                rule_type = rule.get('type', '')
-                column = rule.get('column', '')
-                
-                if rule_type == 'not_null' and column:
-                    df_with_flag = df_with_flag.withColumn(
-                        "dq_flag",
-                        when(col(column).isNull(), False).otherwise(col("dq_flag"))
-                    )
-                    df_with_flag = df_with_flag.withColumn(
-                        "dq_issues",
-                        when(col(column).isNull(), 
-                             concat(col("dq_issues"), lit(f"{column}_null;"))).otherwise(col("dq_issues"))
-                    )
-                
-                elif rule_type == 'regex' and column:
-                    pattern = rule.get('pattern', '')
-                    if pattern:
-                        df_with_flag = df_with_flag.withColumn(
-                            "dq_flag",
-                            when(~col(column).rlike(pattern), False).otherwise(col("dq_flag"))
-                        )
-                        df_with_flag = df_with_flag.withColumn(
-                            "dq_issues",
-                            when(~col(column).rlike(pattern), 
-                                 concat(col("dq_issues"), lit(f"{column}_regex;"))).otherwise(col("dq_issues"))
-                        )
-                
-                elif rule_type == 'range' and column:
-                    min_val = rule.get('min')
-                    max_val = rule.get('max')
-                    if min_val is not None and max_val is not None:
-                        df_with_flag = df_with_flag.withColumn(
-                            "dq_flag",
-                            when((col(column) < min_val) | (col(column) > max_val), False).otherwise(col("dq_flag"))
-                        )
-                        df_with_flag = df_with_flag.withColumn(
-                            "dq_issues",
-                            when((col(column) < min_val) | (col(column) > max_val), 
-                                 concat(col("dq_issues"), lit(f"{column}_range;"))).otherwise(col("dq_issues"))
-                        )
+    # Initialize reject condition
+    reject_condition = lit(False)
     
-    # Separate clean and reject records
-    clean_df = df_with_flag.filter(col("dq_flag") == True).drop("dq_flag", "dq_issues")
-    reject_df = df_with_flag.filter(col("dq_flag") == False).drop("dq_flag")
+    # Apply rules based on common DQ patterns
+    for rule_name, rule_config in rules.items():
+        if isinstance(rule_config, dict):
+            rule_type = rule_config.get('type', '').lower()
+            column = rule_config.get('column', '')
+            
+            if rule_type == 'not_null' and column in df.columns:
+                reject_condition = reject_condition | col(column).isNull()
+                
+            elif rule_type == 'unique' and column in df.columns:
+                window_spec = Window.partitionBy(column)
+                df_with_count = df.withColumn("_count", count("*").over(window_spec))
+                reject_condition = reject_condition | (col("_count") > 1)
+                clean_df = clean_df.drop("_count") if "_count" in clean_df.columns else clean_df
+                
+            elif rule_type == 'range' and column in df.columns:
+                min_val = rule_config.get('min')
+                max_val = rule_config.get('max')
+                if min_val is not None:
+                    reject_condition = reject_condition | (col(column) < min_val)
+                if max_val is not None:
+                    reject_condition = reject_condition | (col(column) > max_val)
+                    
+            elif rule_type == 'regex' and column in df.columns:
+                pattern = rule_config.get('pattern', '')
+                if pattern:
+                    reject_condition = reject_condition | ~col(column).rlike(pattern)
+                    
+            elif rule_type == 'length' and column in df.columns:
+                min_length = rule_config.get('min_length')
+                max_length = rule_config.get('max_length')
+                if min_length is not None:
+                    reject_condition = reject_condition | (length(col(column)) < min_length)
+                if max_length is not None:
+                    reject_condition = reject_condition | (length(col(column)) > max_length)
+    
+    # Split into clean and reject datasets
+    if reject_condition != lit(False):
+        reject_df = df.filter(reject_condition).withColumn("reject_reason", lit("DQ_RULE_VIOLATION"))
+        clean_df = df.filter(~reject_condition)
     
     return clean_df, reject_df
 
-def apply_business_mapping(df, mapping_rules):
-    """Apply business mapping transformations"""
-    if not mapping_rules:
+def apply_business_mapping(df, mapping_df):
+    if mapping_df.empty or df is None:
         return df
     
-    mapped_df = df
-    
-    for rule in mapping_rules:
-        source_col = rule.get('source_column')
-        target_col = rule.get('target_column')
-        transformation = rule.get('transformation')
-        
-        if source_col and target_col:
-            if transformation == 'uppercase':
-                mapped_df = mapped_df.withColumn(target_col, upper(col(source_col)))
-            elif transformation == 'lowercase':
-                mapped_df = mapped_df.withColumn(target_col, lower(col(source_col)))
-            elif transformation == 'trim':
-                mapped_df = mapped_df.withColumn(target_col, trim(col(source_col)))
-            elif transformation == 'date_format':
-                date_format = rule.get('format', 'yyyy-MM-dd')
-                mapped_df = mapped_df.withColumn(target_col, date_format(col(source_col), date_format))
-            else:
-                mapped_df = mapped_df.withColumn(target_col, col(source_col))
-    
-    return mapped_df
-
-def create_glue_table(table_name, s3_location, schema, aws_region, database_name="default"):
-    """Create or update AWS Glue external table"""
     try:
-        glue_client = boto3.client('glue', region_name=aws_region)
+        # Assume mapping has columns: source_column, target_column, transformation
+        for _, row in mapping_df.iterrows():
+            source_col = row.get('source_column', '')
+            target_col = row.get('target_column', '')
+            transformation = row.get('transformation', '')
+            
+            if source_col in df.columns:
+                if transformation and transformation.lower() != 'none':
+                    # Apply basic transformations
+                    if transformation.lower() == 'upper':
+                        df = df.withColumn(target_col, upper(col(source_col)))
+                    elif transformation.lower() == 'lower':
+                        df = df.withColumn(target_col, lower(col(source_col)))
+                    elif transformation.lower() == 'trim':
+                        df = df.withColumn(target_col, trim(col(source_col)))
+                    else:
+                        df = df.withColumn(target_col, col(source_col))
+                else:
+                    # Direct mapping
+                    if target_col != source_col:
+                        df = df.withColumn(target_col, col(source_col))
         
-        # Convert Spark schema to Glue schema
-        columns = []
-        for field in schema.fields:
-            if field.name != 'ingest_date':  # Skip partition column
-                glue_type = 'string'  # Default type
-                if isinstance(field.dataType, IntegerType):
-                    glue_type = 'int'
-                elif
+        return df
+    except Exception as e:
+        print(f"Error applying business mapping: {str(e)}")
+        return df
+
+def create_glue_table(database_name, table_name, s3_location, schema, aws_region, partition_keys=None):
+    glue_client = boto3.client('glue', region_name=aws_region)
+    
+    # Convert Spark schema to Glue format
+    columns = []
+    for field in schema.fields:
+        if partition_keys is None or field.name not in partition_keys:
+            glue_type = spark_to_glue_type(field.dataType)
+            columns.append({
+                'Name': field.name,
+                'Type': glue_type
+            })
+    
+    partitions = []
+    if partition_keys:
+        for partition_key in partition_keys:
+            for field in schema.fields:
+                if field.name == partition_key:
+                    partitions.append({
+                        'Name': field.name,
+                        'Type': spark_to_glue_type(field.dataType)
+                    })
+                    break
+    
+    table_input = {
+        'Name': table_name,
+        'StorageDescriptor': {
+            'Columns': columns,
+            'Location': s3_location,
+            'InputFormat': 'org.apache.hadoop.mapred.TextInputFormat',
+            'OutputFormat': 
