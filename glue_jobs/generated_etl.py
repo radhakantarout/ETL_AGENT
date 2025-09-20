@@ -1,177 +1,177 @@
 ```python
-#!/usr/bin/env python3
-
+import sys
 import argparse
 import json
-import sys
-from datetime import datetime
-from typing import Dict, List, Tuple
-
-import boto3
-import pandas as pd
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
+import boto3
+from botocore.exceptions import ClientError
+import pandas as pd
+from io import StringIO
+import logging
 
-def create_spark_session(app_name: str) -> SparkSession:
-    """Create and configure Spark session"""
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.adaptive.enabled", "true") \
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain") \
-        .getOrCreate()
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def read_s3_file_content(s3_path: str) -> str:
-    """Read file content from S3"""
-    s3 = boto3.client('s3')
-    bucket, key = s3_path.replace('s3://', '').split('/', 1)
-    response = s3.get_object(Bucket=bucket, Key=key)
-    return response['Body'].read().decode('utf-8')
-
-def load_dq_rules(rules_s3_path: str) -> Dict:
-    """Load data quality rules from S3"""
-    try:
-        content = read_s3_file_content(rules_s3_path)
-        return json.loads(content)
-    except Exception as e:
-        print(f"Error loading DQ rules: {e}")
-        return {}
-
-def load_business_mapping(bucket: str) -> Dict:
-    """Load business mapping from Excel file in S3"""
-    try:
-        s3_path = f"s3://{bucket}/business_mapping.xlsx"
-        s3 = boto3.client('s3')
-        bucket_name, key = s3_path.replace('s3://', '').split('/', 1)
+class ETLJob:
+    def __init__(self, rules_s3, s3_bucket, aws_region, ingest_date):
+        self.rules_s3 = rules_s3
+        self.s3_bucket = s3_bucket
+        self.aws_region = aws_region
+        self.ingest_date = ingest_date
+        self.spark = None
+        self.s3_client = None
+        self.glue_client = None
+        self.dq_rules = None
+        self.business_mapping = None
         
-        # Download file to temporary location
-        temp_file = "/tmp/business_mapping.xlsx"
-        s3.download_file(bucket_name, key, temp_file)
-        
-        # Read Excel file
-        df = pd.read_excel(temp_file)
-        
-        # Convert to dictionary mapping
-        mapping = {}
-        for _, row in df.iterrows():
-            if 'source_column' in df.columns and 'target_column' in df.columns:
-                mapping[row['source_column']] = row['target_column']
-        
-        return mapping
-    except Exception as e:
-        print(f"Error loading business mapping: {e}")
-        return {}
-
-def discover_csv_files(spark: SparkSession, source_path: str) -> List[str]:
-    """Discover all CSV files in S3 source path"""
-    try:
-        # Try to read with wildcard pattern
-        csv_path = f"{source_path}/*.csv" if not source_path.endswith('.csv') else source_path
-        
-        # Test read to discover files
-        df = spark.read.option("header", "true").option("inferSchema", "true").csv(csv_path)
-        df.limit(1).collect()  # Trigger execution to validate path
-        
-        return [csv_path]
-    except Exception as e:
-        print(f"Error discovering CSV files: {e}")
-        return []
-
-def apply_data_quality_rules(df: DataFrame, rules: Dict) -> Tuple[DataFrame, DataFrame]:
-    """Apply data quality rules and separate clean vs rejected records"""
-    if not rules:
-        return df.withColumn("dq_status", lit("PASS")), spark.createDataFrame([], df.schema)
-    
-    clean_df = df
-    reject_conditions = []
-    
-    for rule_name, rule_config in rules.items():
-        if rule_config.get("type") == "not_null":
-            columns = rule_config.get("columns", [])
-            for col_name in columns:
-                if col_name in df.columns:
-                    reject_conditions.append(col(col_name).isNull())
-        
-        elif rule_config.get("type") == "range":
-            col_name = rule_config.get("column")
-            min_val = rule_config.get("min")
-            max_val = rule_config.get("max")
-            if col_name and col_name in df.columns:
-                if min_val is not None:
-                    reject_conditions.append(col(col_name) < min_val)
-                if max_val is not None:
-                    reject_conditions.append(col(col_name) > max_val)
-        
-        elif rule_config.get("type") == "regex":
-            col_name = rule_config.get("column")
-            pattern = rule_config.get("pattern")
-            if col_name and pattern and col_name in df.columns:
-                reject_conditions.append(~col(col_name).rlike(pattern))
-    
-    if reject_conditions:
-        # Combine all reject conditions with OR
-        reject_condition = reject_conditions[0]
-        for condition in reject_conditions[1:]:
-            reject_condition = reject_condition | condition
-        
-        # Split into clean and reject dataframes
-        rejects_df = clean_df.filter(reject_condition).withColumn("dq_status", lit("REJECT"))
-        clean_df = clean_df.filter(~reject_condition).withColumn("dq_status", lit("PASS"))
-    else:
-        rejects_df = spark.createDataFrame([], clean_df.schema.add(StructField("dq_status", StringType())))
-        clean_df = clean_df.withColumn("dq_status", lit("PASS"))
-    
-    return clean_df, rejects_df
-
-def apply_business_mapping(df: DataFrame, mapping: Dict) -> DataFrame:
-    """Apply business mapping transformations"""
-    if not mapping:
-        return df
-    
-    # Apply column renaming based on mapping
-    for source_col, target_col in mapping.items():
-        if source_col in df.columns:
-            df = df.withColumnRenamed(source_col, target_col)
-    
-    return df
-
-def write_partitioned_data(df: DataFrame, output_path: str, partition_col: str = "ingest_date"):
-    """Write DataFrame to S3 with partitioning"""
-    if df.count() > 0:
-        df.coalesce(1).write \
-            .mode("overwrite") \
-            .partitionBy(partition_col) \
-            .parquet(output_path)
-
-def create_glue_table(database: str, table_name: str, s3_location: str, columns: List, 
-                     partition_keys: List, region: str):
-    """Create or update AWS Glue external table"""
-    try:
-        glue_client = boto3.client('glue', region_name=region)
-        
-        # Create database if it doesn't exist
-        try:
-            glue_client.create_database(
-                DatabaseInput={
-                    'Name': database,
-                    'Description': 'ETL processed data'
-                }
-            )
-        except glue_client.exceptions.AlreadyExistsException:
-            pass
-        
-        # Prepare table input
-        table_input = {
-            'Name': table_name,
-            'StorageDescriptor': {
-                'Columns': columns,
-                'Location': s3_location,
-                'InputFormat': 'org.apache.hadoop.mapred.TextInputFormat',
-                'OutputFormat': 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
-                'SerdeInfo': {
-                    'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
-                }
-            },
+    def initialize_clients(self):
+        """Initialize Spark session and AWS clients"""
+        self.spark = SparkSession.builder \
+            .appName("ETL_Data_Pipeline") \
+            .config("spark.sql.adaptive.enabled", "true") \
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+            .getOrCreate()
             
+        self.s3_client = boto3.client('s3', region_name=self.aws_region)
+        self.glue_client = boto3.client('glue', region_name=self.aws_region)
+        
+    def load_dq_rules(self):
+        """Load data quality rules from S3"""
+        try:
+            bucket, key = self.rules_s3.replace('s3://', '').split('/', 1)
+            response = self.s3_client.get_object(Bucket=bucket, Key=key)
+            self.dq_rules = json.loads(response['Body'].read().decode('utf-8'))
+            logger.info("Data quality rules loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load DQ rules: {str(e)}")
+            raise
+            
+    def load_business_mapping(self):
+        """Load business mapping from Excel file in S3"""
+        try:
+            response = self.s3_client.get_object(Bucket=self.s3_bucket, Key='business_mapping.xlsx')
+            excel_data = response['Body'].read()
+            self.business_mapping = pd.read_excel(excel_data)
+            logger.info("Business mapping loaded successfully")
+        except Exception as e:
+            logger.warning(f"Business mapping file not found or failed to load: {str(e)}")
+            self.business_mapping = None
+            
+    def discover_csv_files(self):
+        """Discover all CSV files in the raw S3 bucket"""
+        csv_files = []
+        try:
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=self.s3_bucket, Prefix='raw/')
+            
+            for page in pages:
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        if obj['Key'].endswith('.csv'):
+                            csv_files.append(f"s3://{self.s3_bucket}/{obj['Key']}")
+                            
+            logger.info(f"Found {len(csv_files)} CSV files")
+            return csv_files
+        except Exception as e:
+            logger.error(f"Failed to discover CSV files: {str(e)}")
+            raise
+            
+    def read_csv_files(self, csv_files):
+        """Read all CSV files and combine them"""
+        dataframes = []
+        
+        for file_path in csv_files:
+            try:
+                df = self.spark.read.option("header", "true") \
+                    .option("inferSchema", "true") \
+                    .csv(file_path)
+                
+                # Add source file column
+                df = df.withColumn("source_file", lit(file_path))
+                df = df.withColumn("load_date", lit(self.ingest_date))
+                dataframes.append(df)
+                logger.info(f"Successfully read: {file_path}")
+                
+            except Exception as e:
+                logger.error(f"Failed to read {file_path}: {str(e)}")
+                continue
+                
+        if not dataframes:
+            raise Exception("No CSV files could be read")
+            
+        # Union all dataframes
+        combined_df = dataframes[0]
+        for df in dataframes[1:]:
+            combined_df = combined_df.unionByName(df, allowMissingColumns=True)
+            
+        return combined_df
+        
+    def apply_dq_rules(self, df):
+        """Apply data quality rules and separate clean and reject records"""
+        if not self.dq_rules:
+            logger.warning("No DQ rules found, returning original data as clean")
+            return df, self.spark.createDataFrame([], df.schema)
+            
+        conditions = []
+        
+        for rule in self.dq_rules.get('rules', []):
+            rule_type = rule.get('type')
+            column = rule.get('column')
+            
+            if rule_type == 'not_null':
+                conditions.append(col(column).isNotNull())
+            elif rule_type == 'unique':
+                # For unique constraints, we'll mark duplicates as rejects
+                window_spec = Window.partitionBy(column)
+                df = df.withColumn(f"{column}_count", count("*").over(window_spec))
+                conditions.append(col(f"{column}_count") == 1)
+            elif rule_type == 'min_length':
+                min_len = rule.get('value', 0)
+                conditions.append(length(col(column)) >= min_len)
+            elif rule_type == 'max_length':
+                max_len = rule.get('value', 1000)
+                conditions.append(length(col(column)) <= max_len)
+            elif rule_type == 'regex':
+                pattern = rule.get('pattern', '.*')
+                conditions.append(col(column).rlike(pattern))
+            elif rule_type == 'range':
+                min_val = rule.get('min_value')
+                max_val = rule.get('max_value')
+                if min_val is not None:
+                    conditions.append(col(column) >= min_val)
+                if max_val is not None:
+                    conditions.append(col(column) <= max_val)
+                    
+        # Combine all conditions
+        if conditions:
+            combined_condition = conditions[0]
+            for condition in conditions[1:]:
+                combined_condition = combined_condition & condition
+                
+            clean_df = df.filter(combined_condition)
+            reject_df = df.filter(~combined_condition)
+        else:
+            clean_df = df
+            reject_df = self.spark.createDataFrame([], df.schema)
+            
+        # Add DQ validation timestamp
+        clean_df = clean_df.withColumn("dq_validation_timestamp", current_timestamp())
+        reject_df = reject_df.withColumn("dq_validation_timestamp", current_timestamp())
+        reject_df = reject_df.withColumn("reject_reason", lit("Failed DQ validation"))
+        
+        return clean_df, reject_df
+        
+    def write_to_s3(self, df, path, table_name):
+        """Write DataFrame to S3 in Parquet format"""
+        try:
+            df.coalesce(1).write \
+                .mode("overwrite") \
+                .option("compression", "snappy") \
+                .parquet(path)
+            logger.info(f"Successfully wrote {df.count()} records to {path}")
+        except Exception as e:
+            logger.error(f"Failed to write to {path}: {str(e)
