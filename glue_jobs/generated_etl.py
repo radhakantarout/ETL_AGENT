@@ -1,248 +1,208 @@
-import argparse
-import json
 import sys
+import json
+import argparse
+from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
 import boto3
-from botocore.exceptions import ClientError
 import pandas as pd
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from io import StringIO
 
 def create_spark_session(app_name="ETL_Job"):
-    """Create Spark session with S3 configurations"""
     return SparkSession.builder \
         .appName(app_name) \
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain") \
-        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain") \
         .getOrCreate()
 
-def read_dq_rules(spark, rules_s3_path):
-    """Read data quality rules from S3"""
-    try:
-        # Read JSON file from S3
-        df_json = spark.read.text(rules_s3_path)
-        json_content = df_json.collect()[0][0]
-        rules = json.loads(json_content)
-        logger.info(f"Successfully loaded DQ rules from {rules_s3_path}")
-        return rules
-    except Exception as e:
-        logger.error(f"Failed to read DQ rules from {rules_s3_path}: {str(e)}")
-        raise
+def read_s3_file_content(s3_path, aws_region):
+    s3_client = boto3.client('s3', region_name=aws_region)
+    bucket, key = s3_path.replace('s3://', '').split('/', 1)
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    return response['Body'].read().decode('utf-8')
 
-def read_business_mapping(s3_bucket, aws_region):
-    """Read business mapping from Excel file in S3"""
-    try:
-        s3_client = boto3.client('s3', region_name=aws_region)
-        mapping_key = "business_mapping.xlsx"
-        
-        # Download Excel file temporarily
-        local_file = "/tmp/business_mapping.xlsx"
-        s3_client.download_file(s3_bucket, mapping_key, local_file)
-        
-        # Read Excel file
-        mapping_df = pd.read_excel(local_file)
-        logger.info("Successfully loaded business mapping")
-        return mapping_df.to_dict('records')
-    except Exception as e:
-        logger.warning(f"Failed to read business mapping: {str(e)}")
-        return []
+def load_dq_rules(rules_s3_path, aws_region):
+    content = read_s3_file_content(rules_s3_path, aws_region)
+    return json.loads(content)
 
-def apply_dq_rules(df, rules):
-    """Apply data quality rules and separate clean vs rejected records"""
+def load_business_mapping(mapping_s3_path, aws_region):
+    s3_client = boto3.client('s3', region_name=aws_region)
+    bucket, key = mapping_s3_path.replace('s3://', '').split('/', 1)
+    
     try:
-        clean_df = df
-        reject_conditions = []
-        
-        for rule in rules.get('rules', []):
-            rule_name = rule.get('name', 'unknown_rule')
-            rule_condition = rule.get('condition', '')
-            rule_type = rule.get('type', 'filter')
-            
-            if rule_type == 'not_null':
-                columns = rule.get('columns', [])
-                for col in columns:
-                    if col in df.columns:
-                        reject_conditions.append(f"({col} IS NULL)")
-                        clean_df = clean_df.filter(col(col).isNotNull())
-            
-            elif rule_type == 'unique':
-                columns = rule.get('columns', [])
-                if columns:
-                    # Remove duplicates for clean data
-                    clean_df = clean_df.dropDuplicates(columns)
-            
-            elif rule_type == 'range':
-                column = rule.get('column', '')
-                min_val = rule.get('min_value')
-                max_val = rule.get('max_value')
-                if column in df.columns:
-                    if min_val is not None:
-                        reject_conditions.append(f"({column} < {min_val})")
-                        clean_df = clean_df.filter(col(column) >= min_val)
-                    if max_val is not None:
-                        reject_conditions.append(f"({column} > {max_val})")
-                        clean_df = clean_df.filter(col(column) <= max_val)
-            
-            elif rule_type == 'regex':
-                column = rule.get('column', '')
-                pattern = rule.get('pattern', '')
-                if column in df.columns and pattern:
-                    reject_conditions.append(f"({column} NOT RLIKE '{pattern}')")
-                    clean_df = clean_df.filter(col(column).rlike(pattern))
-            
-            elif rule_type == 'custom' and rule_condition:
-                reject_conditions.append(f"NOT ({rule_condition})")
-                clean_df = clean_df.filter(expr(rule_condition))
-        
-        # Create rejects dataframe
-        if reject_conditions:
-            reject_condition = " OR ".join(reject_conditions)
-            rejects_df = df.filter(expr(reject_condition)).withColumn("reject_reason", lit(reject_condition))
-        else:
-            # Create empty rejects dataframe with same schema plus reject_reason
-            rejects_df = spark.createDataFrame([], df.schema.add("reject_reason", StringType()))
-        
-        logger.info(f"Applied {len(rules.get('rules', []))} DQ rules")
-        return clean_df, rejects_df
-        
-    except Exception as e:
-        logger.error(f"Error applying DQ rules: {str(e)}")
-        return df, spark.createDataFrame([], df.schema.add("reject_reason", StringType()))
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        excel_data = response['Body'].read()
+        return pd.read_excel(excel_data)
+    except:
+        return None
 
-def apply_business_mapping(df, mapping_rules):
-    """Apply business mapping transformations"""
-    try:
-        if not mapping_rules:
-            return df
-        
-        mapped_df = df
-        
-        for rule in mapping_rules:
-            source_col = rule.get('source_column', '')
-            target_col = rule.get('target_column', source_col)
-            transformation = rule.get('transformation', 'direct')
-            
-            if source_col in df.columns:
-                if transformation == 'direct':
-                    if source_col != target_col:
-                        mapped_df = mapped_df.withColumnRenamed(source_col, target_col)
-                
-                elif transformation == 'upper':
-                    mapped_df = mapped_df.withColumn(target_col, upper(col(source_col)))
-                
-                elif transformation == 'lower':
-                    mapped_df = mapped_df.withColumn(target_col, lower(col(source_col)))
-                
-                elif transformation == 'trim':
-                    mapped_df = mapped_df.withColumn(target_col, trim(col(source_col)))
-                
-                elif transformation == 'date_format':
-                    target_format = rule.get('target_format', 'yyyy-MM-dd')
-                    source_format = rule.get('source_format', 'yyyy-MM-dd')
-                    mapped_df = mapped_df.withColumn(target_col, 
-                                                   date_format(to_date(col(source_col), source_format), target_format))
-        
-        logger.info(f"Applied {len(mapping_rules)} business mapping rules")
-        return mapped_df
-        
-    except Exception as e:
-        logger.error(f"Error applying business mapping: {str(e)}")
+def discover_csv_files(spark, source_path):
+    hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
+    fs = spark.sparkContext._jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
+    path = spark.sparkContext._jvm.org.apache.hadoop.fs.Path(source_path)
+    
+    files = []
+    if fs.exists(path):
+        file_statuses = fs.listStatus(path)
+        for file_status in file_statuses:
+            file_path = str(file_status.getPath())
+            if file_path.endswith('.csv'):
+                files.append(file_path)
+    
+    return files
+
+def infer_schema_and_read_csv(spark, file_paths):
+    if not file_paths:
+        return None
+    
+    # Read first file to infer schema
+    sample_df = spark.read.option("header", "true").option("inferSchema", "true").csv(file_paths[0])
+    
+    # Read all files with inferred schema
+    all_files_pattern = file_paths[0].rsplit('/', 1)[0] + "/*.csv"
+    df = spark.read.option("header", "true").option("inferSchema", "true").csv(all_files_pattern)
+    
+    return df
+
+def apply_dq_rules(df, dq_rules):
+    clean_df = df
+    reject_df = None
+    
+    for table_name, rules in dq_rules.items():
+        if 'columns' in rules:
+            for column_name, column_rules in rules['columns'].items():
+                if column_name in df.columns:
+                    # Apply null checks
+                    if column_rules.get('nullable') == False:
+                        reject_condition = col(column_name).isNull()
+                        if reject_df is None:
+                            reject_df = clean_df.filter(reject_condition).withColumn("reject_reason", lit(f"{column_name}_null"))
+                        else:
+                            reject_df = reject_df.union(
+                                clean_df.filter(reject_condition).withColumn("reject_reason", lit(f"{column_name}_null"))
+                            )
+                        clean_df = clean_df.filter(~reject_condition)
+                    
+                    # Apply data type validation
+                    if 'data_type' in column_rules:
+                        expected_type = column_rules['data_type']
+                        if expected_type == 'integer':
+                            reject_condition = ~col(column_name).rlike("^[+-]?[0-9]+$")
+                        elif expected_type == 'decimal':
+                            reject_condition = ~col(column_name).rlike("^[+-]?[0-9]*\\.?[0-9]+$")
+                        elif expected_type == 'date':
+                            reject_condition = col(column_name).isNull() | (to_date(col(column_name)).isNull())
+                        else:
+                            continue
+                        
+                        if reject_df is None:
+                            reject_df = clean_df.filter(reject_condition).withColumn("reject_reason", lit(f"{column_name}_type_mismatch"))
+                        else:
+                            reject_df = reject_df.union(
+                                clean_df.filter(reject_condition).withColumn("reject_reason", lit(f"{column_name}_type_mismatch"))
+                            )
+                        clean_df = clean_df.filter(~reject_condition)
+                    
+                    # Apply length validation
+                    if 'max_length' in column_rules:
+                        max_len = column_rules['max_length']
+                        reject_condition = length(col(column_name)) > max_len
+                        if reject_df is None:
+                            reject_df = clean_df.filter(reject_condition).withColumn("reject_reason", lit(f"{column_name}_length_exceeded"))
+                        else:
+                            reject_df = reject_df.union(
+                                clean_df.filter(reject_condition).withColumn("reject_reason", lit(f"{column_name}_length_exceeded"))
+                            )
+                        clean_df = clean_df.filter(~reject_condition)
+    
+    if reject_df is None:
+        reject_df = spark.createDataFrame([], df.schema.add(StructField("reject_reason", StringType(), True)))
+    
+    return clean_df, reject_df
+
+def apply_business_mapping(df, mapping_df):
+    if mapping_df is None or mapping_df.empty:
         return df
+    
+    # Apply column mappings if mapping file exists
+    for _, row in mapping_df.iterrows():
+        if 'source_column' in mapping_df.columns and 'target_column' in mapping_df.columns:
+            source_col = row['source_column']
+            target_col = row['target_column']
+            if source_col in df.columns and source_col != target_col:
+                df = df.withColumnRenamed(source_col, target_col)
+    
+    return df
 
-def create_glue_table(table_name, s3_path, schema, s3_bucket, aws_region, database_name="default"):
-    """Create or update Glue external table"""
-    try:
-        glue_client = boto3.client('glue', region_name=aws_region)
-        
-        # Convert Spark schema to Glue columns
-        columns = []
-        for field in schema.fields:
-            if field.name != 'ingest_date':  # Exclude partition column
-                glue_type = spark_to_glue_type(field.dataType)
-                columns.append({
-                    'Name': field.name,
-                    'Type': glue_type
-                })
-        
-        table_input = {
-            'Name': table_name,
-            'StorageDescriptor': {
-                'Columns': columns,
-                'Location': s3_path,
-                'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
-                'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
-                'SerdeInfo': {
-                    'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
-                }
-            },
-            'PartitionKeys': [
-                {
-                    'Name': 'ingest_date',
-                    'Type': 'string'
-                }
-            ]
-        }
-        
-        try:
-            # Try to update existing table
-            glue_client.update_table(
-                DatabaseName=database_name,
-                TableInput=table_input
-            )
-            logger.info(f"Updated Glue table: {table_name}")
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'EntityNotFoundException':
-                # Create new table
-                glue_client.create_table(
-                    DatabaseName=database_name,
-                    TableInput=table_input
-                )
-                logger.info(f"Created Glue table: {table_name}")
-            else:
-                raise
-                
-    except Exception as e:
-        logger.error(f"Failed to create/update Glue table {table_name}: {str(e)}")
-
-def spark_to_glue_type(spark_type):
-    """Convert Spark data type to Glue data type"""
-    type_mapping = {
-        'StringType': 'string',
-        'IntegerType': 'int',
-        'LongType': 'bigint',
-        'DoubleType': 'double',
-        'FloatType': 'float',
-        'BooleanType': 'boolean',
-        'DateType': 'date',
-        'TimestampType': 'timestamp'
+def create_glue_table(database_name, table_name, s3_location, columns, aws_region, partition_keys=None):
+    glue_client = boto3.client('glue', region_name=aws_region)
+    
+    storage_descriptor = {
+        'Columns': columns,
+        'Location': s3_location,
+        'InputFormat': 'org.apache.hadoop.mapred.TextInputFormat',
+        'OutputFormat': 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+        'SerdeInfo': {
+            'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+        },
+        'StoredAsSubDirectories': False
     }
-    return type_mapping.get(type(spark_type).__name__, 'string')
-
-def get_csv_files_from_s3(s3_bucket, prefix="raw/"):
-    """Get list of CSV files from S3 bucket"""
+    
+    if partition_keys:
+        storage_descriptor['PartitionKeys'] = partition_keys
+    
+    table_input = {
+        'Name': table_name,
+        'StorageDescriptor': storage_descriptor,
+        'TableType': 'EXTERNAL_TABLE'
+    }
+    
     try:
-        s3_client = boto3.client('s3')
-        response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=prefix)
-        
-        csv_files = []
-        if 'Contents' in response:
-            for obj in response['Contents']:
-                if obj['Key'].lower().endswith('.csv'):
-                    csv_files.append(f"s3://{s3_bucket}/{obj['Key']}")
-        
-        logger.info(f"Found {len(csv_files)} CSV files in s3://{s3_bucket}/{prefix}")
-        return csv_files
+        # Try to update existing table
+        glue_client.update_table(
+            DatabaseName=database_name,
+            TableInput=table_input
+        )
+        print(f"Updated Glue table: {database_name}.{table_name}")
+    except glue_client.exceptions.EntityNotFoundException:
+        # Create new table if it doesn't exist
+        glue_client.create_table(
+            DatabaseName=database_name,
+            TableInput=table_input
+        )
+        print(f"Created Glue table: {database_name}.{table_name}")
     except Exception as e:
-        logger.error(f"Error listing S3 objects: {str(e)}")
-        return []
+        print(f"Error creating/updating Glue table {database_name}.{table_name}: {str(e)}")
+
+def spark_to_glue_columns(df):
+    columns = []
+    for field in df.schema.fields:
+        if field.name != 'ingest_date':  # Exclude partition column
+            glue_type = 'string'  # Default
+            if isinstance(field.dataType, IntegerType):
+                glue_type = 'int'
+            elif isinstance(field.dataType, LongType):
+                glue_type = 'bigint'
+            elif isinstance(field.dataType, DoubleType):
+                glue_type = 'double'
+            elif isinstance(field.dataType, FloatType):
+                glue_type = 'float'
+            elif isinstance(field.dataType, BooleanType):
+                glue_type = 'boolean'
+            elif isinstance(field.dataType, DateType):
+                glue_type = 'date'
+            elif isinstance(field.dataType, TimestampType):
+                glue_type = 'timestamp'
+            
+            columns.append({
+                'Name': field.name,
+                'Type': glue_type
+            })
+    return columns
 
 def main():
     parser = argparse.ArgumentParser(description='PySpark ETL Job')
@@ -253,76 +213,123 @@ def main():
     
     args = parser.parse_args()
     
-    # Create Spark session
-    spark = create_spark_session()
+    # Initialize Spark session
+    spark = create_spark_session("CSV_ETL_Job")
     
     try:
-        # Read DQ rules
-        dq_rules = read_dq_rules(spark, args.rules_s3)
+        # Define paths
+        source_path = f"s3://{args.s3_bucket}/raw/"
+        access_path = f"s3://{args.s3_bucket}/access/"
+        mart_path = f"s3://{args.s3_bucket}/mart/"
+        mapping_path = f"s3://{args.s3_bucket}/raw/business_mapping.xlsx"
         
-        # Read business mapping
-        business_mapping = read_business_mapping(args.s3_bucket, args.aws_region)
+        # Load DQ rules
+        print("Loading DQ rules...")
+        dq_rules = load_dq_rules(args.rules_s3, args.aws_region)
         
-        # Get CSV files from S3
-        csv_files = get_csv_files_from_s3(args.s3_bucket, "raw/")
+        # Load business mapping
+        print("Loading business mapping...")
+        mapping_df = load_business_mapping(mapping_path, args.aws_region)
+        
+        # Discover and read CSV files
+        print("Discovering CSV files...")
+        csv_files = discover_csv_files(spark, source_path)
         
         if not csv_files:
-            logger.error("No CSV files found in S3 bucket")
-            sys.exit(1)
+            print("No CSV files found in source path")
+            return
         
-        # Process each CSV file or read all at once
-        source_path = f"s3://{args.s3_bucket}/raw/*.csv"
+        print(f"Found {len(csv_files)} CSV files")
         
-        try:
-            # Read CSV files
-            df = spark.read.option("header", "true").option("inferSchema", "true").csv(source_path)
-            logger.info(f"Successfully read data from {source_path}")
-            
-            # Determine category from file path or use default
-            category = "general"  # You might want to extract this from file names
-            
-            # Apply DQ rules
-            clean_df, rejects_df = apply_dq_rules(df, dq_rules)
-            
-            # Add ingest_date partition column
-            clean_df = clean_df.withColumn("ingest_date", lit(args.ingest_date))
-            rejects_df = rejects_df.withColumn("ingest_date", lit(args.ingest_date))
-            
-            # Write clean data to access layer
-            access_path = f"s3://{args.s3_bucket}/access/{category}"
-            clean_df.write.mode("append").partitionBy("ingest_date").parquet(access_path)
-            logger.info(f"Written clean data to {access_path}")
-            
-            # Write rejects
-            rejects_path = f"s3://{args.s3_bucket}/access/{category}/rejects"
-            if rejects_df.count() > 0:
-                rejects_df.write.mode("append").partitionBy("ingest_date").parquet(rejects_path)
-                logger.info(f"Written rejects to {rejects_path}")
-            
-            # Apply business mapping for mart layer
-            mart_df = apply_business_mapping(clean_df, business_mapping)
-            
-            # Write to mart layer
-            mart_path = f"s3://{args.s3_bucket}/mart/{category}"
-            mart_df.write.mode("append").partitionBy("ingest_date").parquet(mart_path)
-            logger.info(f"Written mart data to {mart_path}")
-            
-            # Create/Update Glue tables
-            create_glue_table(f"access_{category}", access_path, clean_df.schema, args.s3_bucket, args.aws_region)
-            create_glue_table(f"mart_{category}", mart_path, mart_df.schema, args.s3_bucket, args.aws_region)
-            
-            if rejects_df.count() > 0:
-                create_glue_table(f"rejects_{category}", rejects_path, rejects_df.schema, args.s3_bucket, args.aws_region)
-            
-            logger.info("ETL job completed successfully")
-            
-        except Exception as e:
-            logger.error(f"Error processing data: {str(e)}")
-            raise
-            
+        # Read CSV data
+        print("Reading CSV data...")
+        df = infer_schema_and_read_csv(spark, csv_files)
+        
+        if df is None:
+            print("No data to process")
+            return
+        
+        # Add ingest_date column
+        df = df.withColumn("ingest_date", lit(args.ingest_date))
+        
+        print(f"Total records: {df.count()}")
+        
+        # Apply DQ rules
+        print("Applying DQ rules...")
+        clean_df, reject_df = apply_dq_rules(df, dq_rules)
+        
+        print(f"Clean records: {clean_df.count()}")
+        print(f"Rejected records: {reject_df.count()}")
+        
+        # Determine category from source data (use first table name from DQ rules or default)
+        category = list(dq_rules.keys())[0] if dq_rules else "data"
+        
+        # Write clean data to access layer
+        clean_output_path = f"{access_path}{category}/"
+        print(f"Writing clean data to {clean_output_path}")
+        clean_df.write.mode("overwrite") \
+            .partitionBy("ingest_date") \
+            .parquet(clean_output_path)
+        
+        # Write rejects
+        reject_output_path = f"{access_path}{category}/rejects/"
+        print(f"Writing rejects to {reject_output_path}")
+        reject_df.write.mode("overwrite") \
+            .partitionBy("ingest_date") \
+            .parquet(reject_output_path)
+        
+        # Apply business mapping and create mart
+        print("Creating mart data...")
+        mart_df = apply_business_mapping(clean_df, mapping_df)
+        mart_output_path = f"{mart_path}{category}/"
+        print(f"Writing mart data to {mart_output_path}")
+        mart_df.write.mode("overwrite") \
+            .partitionBy("ingest_date") \
+            .parquet(mart_output_path)
+        
+        # Create Glue tables
+        print("Creating/updating Glue tables...")
+        
+        # Access layer table
+        access_columns = spark_to_glue_columns(clean_df)
+        partition_keys = [{'Name': 'ingest_date', 'Type': 'string'}]
+        
+        create_glue_table(
+            database_name="access_db",
+            table_name=f"{category}_clean",
+            s3_location=clean_output_path,
+            columns=access_columns,
+            aws_region=args.aws_region,
+            partition_keys=partition_keys
+        )
+        
+        # Rejects table
+        reject_columns = spark_to_glue_columns(reject_df)
+        create_glue_table(
+            database_name="access_db",
+            table_name=f"{category}_rejects",
+            s3_location=reject_output_path,
+            columns=reject_columns,
+            aws_region=args.aws_region,
+            partition_keys=partition_keys
+        )
+        
+        # Mart layer table
+        mart_columns = spark_to_glue_columns(mart_df)
+        create_glue_table(
+            database_name="mart_db",
+            table_name=f"{category}_mart",
+            s3_location=mart_output_path,
+            columns=mart_columns,
+            aws_region=args.aws_region,
+            partition_keys=partition_keys
+        )
+        
+        print("ETL job completed successfully!")
+        
     except Exception as e:
-        logger.error(f"ETL job failed: {str(e)}")
-        sys.exit(1)
+        print(f"Error in ETL job: {str(e)}")
+        raise e
     finally:
         spark.stop()
 
